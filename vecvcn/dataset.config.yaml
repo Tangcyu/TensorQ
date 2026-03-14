@@ -1,0 +1,41 @@
+MultiState:
+  topology_file: "../TOP_files/triala.psf"
+  dcd_folder: "/home/ctang/0.TEST_NEW_IDEAs/1.Diffuse+Committor/1.Final.Iterations/2.Triala/0th.AandB/3.TMD"
+  output_dir: "./dataset/"
+  match: "Unbias"
+
+  sel_weights: "not name H*"
+  sel_output: "not name H*"
+  every: 5
+  colvars_mismatch: true
+
+  riteweight:
+    n_clusters: 100
+    n_iter: 200
+    tol: 1.0e-6
+    tol_window: 5
+    avg_last: 20
+    seed: 2026
+    lag: 1
+
+  n_clusters: null
+  kmin: 2
+  kmax: 12
+  elbow_method: "knee"
+  standardize_features: true
+  cluster_space: "features"
+  pca_cluster_dim: 20
+  intermediate_quantile: 0.2
+  kmeans_random_state: 10
+  kmeans_n_init: "auto"
+
+  save_format: "pt"
+  save_cv: true
+  cvs_to_save: ["phi1", "phi2", "phi3"]
+  periodic: false
+  make_pairwise_committor: true
+  pairwise_prefix: "q"
+
+  write_concat_dcd: false
+  write_diag_plots: true
+  # dataset_path: "./dataset/dataset.pt"

@@ -2,9 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Reweight unbiased-shooting trajectories via PCA(2D) free-energy reconstruction,
-then cluster conformations into meta-stable states using KMeans with AUTOMATIC k
-(from elbow), in the 3N-6 minimal internal-coordinate feature space.
+Reweight unbiased-shooting trajectories via RiteWeight on internal-coordinate
+features, then cluster conformations into meta-stable states using KMeans with
+automatic k from elbow selection.
+
+The script accepts either:
+- a dedicated `MultiState:` config block, or
+- a legacy flat config file.
+
+It also supports `--relabel-only`, which reloads an existing dataset and
+recomputes only the meta-state labels without rerunning feature extraction or
+RiteWeight.
 
 Outputs a compact dataset (prefer torch .pt, fallback .npz) containing:
 - features: (n_frames, 3N-6) float32   # for committor training
@@ -16,19 +24,29 @@ Outputs a compact dataset (prefer torch .pt, fallback .npz) containing:
 - optional: concatenated DCD + diagnostic figures
 
 YAML keys (minimum):
-  topology_file: "xxx.psf"
-  dcd_folder: "path/to/dcds"
-  output_dir: "out"
-  match: "shoot_"          # filename prefix match for .dcd
-  sel_weights: "protein and not name H*"
-  sel_output:  "protein and not name H*"
-  every: 1
-  temperature: 300
-  split: 0.1               # fraction for init/final histogram
-  ndim: 2                  # PCA dim for reweighting projection (must be 2 here)
-  colvars_mismatch: true
+  MultiState:
+    topology_file: "xxx.psf"
+    dcd_folder: "path/to/dcds"
+    output_dir: "out"
+    match: "shoot_"          # filename prefix match for .dcd
+    sel_weights: "protein and not name H*"
+    sel_output:  "protein and not name H*"
+    every: 1
+    colvars_mismatch: true
+
+RiteWeight:
+  MultiState:
+    riteweight:
+      n_clusters: 100
+      n_iter: 200
+      tol: 1.0e-6
+      tol_window: 5
+      avg_last: 20
+      seed: 2026
+      lag: 1
 
 Elbow+KMeans:
+  n_clusters: null         # set an integer to choose k by hand
   kmin: 2
   kmax: 12
   elbow_method: "knee"     # "knee" or "second_derivative"
@@ -63,13 +81,11 @@ from tqdm import tqdm
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from scipy.linalg import eig
 
 from MDAnalysis import Universe
 from MDAnalysis.coordinates.DCD import DCDWriter
 from MDAnalysis.lib.distances import calc_bonds, calc_angles, calc_dihedrals
-
-# Boltzmann constant in kcal/mol/K
-kB = 0.0019872041
 
 # ---- optional torch ----
 try:
@@ -164,6 +180,121 @@ def read_colvars(colvars_path, index_mismatch=True, skip_rows=1):
 
     data = data[:, keep_indices]
     return headers, data
+
+
+# =========================================================
+# === Helpers: RiteWeight
+# =========================================================
+
+def assign_clusters_random_centers(X: np.ndarray, n_clusters: int, rng: np.random.Generator) -> np.ndarray:
+    n_frames = X.shape[0]
+    if n_clusters >= n_frames:
+        raise ValueError(f"riteweight.n_clusters ({n_clusters}) must be < number of frames ({n_frames}).")
+
+    center_idx = rng.choice(n_frames, size=n_clusters, replace=False)
+    centers = X[center_idx]
+    x2 = np.sum(X * X, axis=1, keepdims=True)
+    c2 = np.sum(centers * centers, axis=1, keepdims=True).T
+    d2 = x2 + c2 - 2.0 * (X @ centers.T)
+    return np.argmin(d2, axis=1).astype(np.int32)
+
+
+def build_transition_matrix(start_labels, end_labels, weights, n_clusters, eps=1e-15):
+    trans_num = np.zeros((n_clusters, n_clusters), dtype=np.float64)
+    cluster_weight = np.zeros(n_clusters, dtype=np.float64)
+    np.add.at(cluster_weight, start_labels, weights)
+    np.add.at(trans_num, (start_labels, end_labels), weights)
+
+    trans = trans_num / (cluster_weight[:, None] + eps)
+    zero_rows = cluster_weight <= eps
+    if np.any(zero_rows):
+        trans[zero_rows, :] = 0.0
+        trans[zero_rows, np.where(zero_rows)[0]] = 1.0
+
+    trans = np.clip(trans, 0.0, 1.0)
+    row_sum = trans.sum(axis=1, keepdims=True)
+    trans = trans / (row_sum + eps)
+    return trans, cluster_weight
+
+
+def stationary_distribution(trans):
+    vals, vecs = eig(trans.T)
+    idx = int(np.argmin(np.abs(vals - 1.0)))
+    vec = np.real(vecs[:, idx])
+    vec = np.abs(vec)
+    norm = vec.sum()
+    if norm <= 0:
+        raise RuntimeError("Failed to compute a valid stationary distribution in RiteWeight.")
+    return vec / norm
+
+
+def riteweight(X, seg_start_idx, seg_end_idx, n_clusters, n_iter, tol, tol_window, avg_last, seed):
+    rng = np.random.default_rng(seed)
+    n_segments = seg_start_idx.size
+    seg_weights = np.full(n_segments, 1.0 / n_segments, dtype=np.float64)
+    prev_weights = seg_weights.copy()
+    delta_history = []
+    stable_steps = 0
+    trailing_weights = []
+
+    for it in tqdm(range(1, n_iter + 1), desc="RiteWeight"):
+        labels = assign_clusters_random_centers(X, n_clusters, rng)
+        start_labels = labels[seg_start_idx]
+        end_labels = labels[seg_end_idx]
+
+        trans, cluster_weight = build_transition_matrix(start_labels, end_labels, seg_weights, n_clusters)
+        pi = stationary_distribution(trans)
+
+        scale = pi / (cluster_weight + 1e-15)
+        new_weights = seg_weights * scale[start_labels]
+        new_weights = np.clip(new_weights, 0.0, np.inf)
+        new_weights /= new_weights.sum()
+
+        delta = float(np.sum(np.abs(new_weights - prev_weights)))
+        delta_history.append(delta)
+        stable_steps = stable_steps + 1 if delta < tol else 0
+
+        if it > max(1, n_iter - avg_last):
+            trailing_weights.append(new_weights.copy())
+
+        prev_weights = seg_weights
+        seg_weights = new_weights
+        if stable_steps >= tol_window:
+            break
+
+    if trailing_weights:
+        seg_weights = np.mean(np.stack(trailing_weights, axis=0), axis=0)
+        seg_weights = np.clip(seg_weights, 0.0, np.inf)
+        seg_weights /= seg_weights.sum()
+
+    frame_weights = np.zeros(X.shape[0], dtype=np.float64)
+    np.add.at(frame_weights, seg_start_idx, seg_weights)
+    frame_weights /= frame_weights.sum()
+    return frame_weights.astype(np.float32), np.asarray(delta_history, dtype=np.float32)
+
+
+def build_segment_indices(frame_counts, lag):
+    seg_start = []
+    seg_end = []
+    offset = 0
+
+    for n_frames in frame_counts:
+        if n_frames <= lag:
+            offset += n_frames
+            continue
+        starts = np.arange(offset, offset + n_frames - lag, dtype=np.int64)
+        ends = starts + lag
+        seg_start.append(starts)
+        seg_end.append(ends)
+        offset += n_frames
+
+    if not seg_start:
+        raise RuntimeError(
+            f"No valid RiteWeight segments were built. Reduce riteweight.lag (current lag={lag}) "
+            "or provide longer trajectories."
+        )
+
+    return np.concatenate(seg_start), np.concatenate(seg_end)
 
 
 # =========================================================
@@ -271,11 +402,135 @@ def build_pairwise_labels(meta_state, n_states):
     return pair_labels, pairs
 
 
+def infer_dataset_path(output_dir, save_format, dataset_path=None):
+    if dataset_path:
+        return dataset_path
+    ext = ".pt" if str(save_format).lower() == "pt" else ".npz"
+    return os.path.join(output_dir, "dataset" + ext)
+
+
+def load_saved_dataset(dataset_path):
+    ext = os.path.splitext(dataset_path)[1].lower()
+    if ext == ".pt":
+        if not TORCH_OK:
+            raise RuntimeError("torch is required to read a .pt dataset.")
+        pack = torch.load(dataset_path, map_location="cpu")
+        features = pack["features"].detach().cpu().numpy().astype(np.float32)
+        weights = pack["weights"].detach().cpu().numpy().astype(np.float32)
+        meta_state = pack.get("meta_state")
+        if meta_state is not None:
+            meta_state = meta_state.detach().cpu().numpy().astype(np.int64)
+        dist_to_centroid = pack.get("dist_to_centroid")
+        if dist_to_centroid is not None:
+            dist_to_centroid = dist_to_centroid.detach().cpu().numpy().astype(np.float32)
+        cv_data = pack.get("cv")
+        if cv_data is not None:
+            cv_data = cv_data.detach().cpu().numpy().astype(np.float32)
+        pair_labels = pack.get("pair_labels")
+        if pair_labels is not None:
+            pair_labels = pair_labels.detach().cpu().numpy().astype(np.int8)
+        meta = pack.get("meta", {})
+        return {
+            "format": "pt",
+            "pack": pack,
+            "features": features,
+            "weights": weights,
+            "meta_state": meta_state,
+            "dist_to_centroid": dist_to_centroid,
+            "cv": cv_data,
+            "pair_labels": pair_labels,
+            "meta": meta if isinstance(meta, dict) else {},
+        }
+
+    if ext == ".npz":
+        data = np.load(dataset_path, allow_pickle=True)
+        meta = {}
+        if "meta_yaml" in data:
+            meta_yaml = data["meta_yaml"]
+            if len(meta_yaml) > 0:
+                meta = yaml.safe_load(str(meta_yaml[0])) or {}
+        return {
+            "format": "npz",
+            "pack": data,
+            "features": data["features"].astype(np.float32),
+            "weights": data["weights"].astype(np.float32),
+            "meta_state": data["meta_state"].astype(np.int64) if "meta_state" in data else None,
+            "dist_to_centroid": data["dist_to_centroid"].astype(np.float32) if "dist_to_centroid" in data else None,
+            "cv": data["cv"].astype(np.float32) if "cv" in data else None,
+            "pair_labels": data["pair_labels"].astype(np.int8) if "pair_labels" in data else None,
+            "meta": meta if isinstance(meta, dict) else {},
+        }
+
+    raise ValueError(f"Unsupported dataset extension for relabel-only: {dataset_path}")
+
+
+def save_dataset(dataset_path, save_format, features_all, weights, meta_state, dist_to_centroid,
+                 thresholds, meta, cv_data=None, pair_labels=None):
+    if save_format == "pt":
+        if not TORCH_OK:
+            raise RuntimeError("torch is required to save a .pt dataset.")
+        pack = {
+            "features": torch.from_numpy(features_all.astype(np.float32)),
+            "weights": torch.from_numpy(weights.astype(np.float32)),
+            "meta_state": torch.from_numpy(meta_state.astype(np.int64)),
+            "dist_to_centroid": torch.from_numpy(dist_to_centroid.astype(np.float32)),
+            "meta": meta,
+        }
+        if cv_data is not None:
+            pack["cv"] = torch.from_numpy(cv_data.astype(np.float32))
+        if pair_labels is not None:
+            pack["pair_labels"] = torch.from_numpy(pair_labels.astype(np.int8))
+        torch.save(pack, dataset_path)
+    else:
+        npz_dict = {
+            "features": features_all.astype(np.float32),
+            "weights": weights.astype(np.float32),
+            "meta_state": meta_state.astype(np.int64),
+            "dist_to_centroid": dist_to_centroid.astype(np.float32),
+            "thresholds": thresholds.astype(np.float32),
+        }
+        if cv_data is not None:
+            npz_dict["cv"] = cv_data.astype(np.float32)
+        if pair_labels is not None:
+            npz_dict["pair_labels"] = pair_labels.astype(np.int8)
+        npz_dict["meta_yaml"] = np.array([yaml.safe_dump(meta, sort_keys=False, allow_unicode=True)], dtype=object)
+        np.savez_compressed(dataset_path, **npz_dict)
+
+
+def select_k_for_clustering(X_cluster, config, write_diag=False, elbow_png=None):
+    manual_k = config.get("n_clusters", None)
+    if manual_k is not None:
+        best_k = int(manual_k)
+        if best_k < 1:
+            raise ValueError("n_clusters must be >= 1 when choosing k by hand.")
+        ks = [best_k]
+        inertias = []
+        print(f"[KMeans] Using user-specified k = {best_k}")
+        return best_k, ks, inertias
+
+    kmin = int(config.get("kmin", 2))
+    kmax = int(config.get("kmax", 12))
+    elbow_method = config.get("elbow_method", "knee")
+    kmeans_random_state = int(config.get("kmeans_random_state", 0))
+    kmeans_n_init = config.get("kmeans_n_init", "auto")
+    best_k, ks, inertias = choose_k_elbow(
+        X_cluster,
+        kmin=kmin,
+        kmax=kmax,
+        method=elbow_method,
+        random_state=kmeans_random_state,
+        n_init=kmeans_n_init,
+        out_png=(elbow_png if write_diag else None),
+    )
+    print(f"[KMeans] Elbow selected k = {best_k}")
+    return best_k, ks, inertias.tolist()
+
+
 # =========================================================
 # === Main
 # =========================================================
 
-def run_pipeline(config):
+def run_pipeline(config, relabel_only=False):
     psf_path = config["topology_file"]
     dcd_folder = config["dcd_folder"]
     output_dir = config["output_dir"]
@@ -284,7 +539,7 @@ def run_pipeline(config):
     # ---- IO names ----
     dataset_base = os.path.join(output_dir, "dataset")
     weights_csv = os.path.join(output_dir, "weights_and_labels.csv")  # optional debug
-    deltaF_png = os.path.join(output_dir, "deltaF_pca.png")
+    riteweight_png = os.path.join(output_dir, "riteweight_convergence.png")
     elbow_png = os.path.join(output_dir, "elbow_kmeans.png")
 
     # ---- selections ----
@@ -292,20 +547,22 @@ def run_pipeline(config):
     selection_output = config.get("sel_output", "protein and not name H*")
 
     # ---- sampling / weighting ----
-    temperature = float(config.get("temperature", 300))
-    ndim = int(config.get("ndim", 2))
-    if ndim != 2:
-        raise ValueError("For the current reweighting implementation, ndim must be 2 (2D PCA grid).")
-    split = float(config.get("split", 0.1))
     every = int(config.get("every", 1))
     index_mismatch = bool(config.get("colvars_mismatch", True))
     periodic = bool(config.get("periodic", False))
-    beta = 1.0 / (kB * temperature)
+
+    rw_cfg = config.get("riteweight", {})
+    rw_n_clusters = rw_cfg.get("n_clusters", config.get("rw_n_clusters", 100))
+    rw_n_iter = int(rw_cfg.get("n_iter", config.get("rw_n_iter", 200)))
+    rw_tol = float(rw_cfg.get("tol", config.get("rw_tol", 1e-6)))
+    rw_tol_window = int(rw_cfg.get("tol_window", config.get("rw_tol_window", 5)))
+    rw_avg_last = int(rw_cfg.get("avg_last", config.get("rw_avg_last", 20)))
+    rw_seed = int(rw_cfg.get("seed", config.get("rw_seed", 2026)))
+    rw_lag = int(rw_cfg.get("lag", config.get("lag", 1)))
+    if rw_lag < 1:
+        raise ValueError("riteweight.lag must be >= 1.")
 
     # ---- elbow/kmeans ----
-    kmin = int(config.get("kmin", 2))
-    kmax = int(config.get("kmax", 12))
-    elbow_method = config.get("elbow_method", "knee")
     inter_quantile = float(config.get("intermediate_quantile", 0.9))
     kmeans_random_state = int(config.get("kmeans_random_state", 0))
     kmeans_n_init = config.get("kmeans_n_init", "auto")
@@ -320,8 +577,99 @@ def run_pipeline(config):
     cvs_to_save = config.get("cvs_to_save", [])  # if empty -> all colvars
     write_diag = bool(config.get("write_diag_plots", True))
     write_concat_dcd = bool(config.get("write_concat_dcd", False))
+    dataset_path = infer_dataset_path(output_dir, save_format, config.get("dataset_path"))
 
     make_pairwise = bool(config.get("make_pairwise_committor", True))
+
+    if relabel_only:
+        if not os.path.exists(dataset_path):
+            raise FileNotFoundError(f"--relabel-only requires an existing dataset: {dataset_path}")
+
+        loaded = load_saved_dataset(dataset_path)
+        features_all = loaded["features"]
+        weights = loaded["weights"]
+        cv_data = loaded["cv"]
+        meta = loaded["meta"]
+        cv_headers = meta.get("cv_headers", None)
+        n_frames, feat_dim = features_all.shape
+
+        X_cluster = features_all
+        if standardize:
+            scaler = StandardScaler()
+            X_cluster = scaler.fit_transform(X_cluster)
+
+        if cluster_space == "pca_highdim":
+            ncomp = min(pca_cluster_dim, X_cluster.shape[1])
+            pca_cluster = PCA(n_components=ncomp)
+            X_cluster = pca_cluster.fit_transform(X_cluster)
+
+        best_k, ks, inertias = select_k_for_clustering(
+            X_cluster,
+            config,
+            write_diag=write_diag,
+            elbow_png=elbow_png,
+        )
+        meta_state, dist_to_centroid, thresholds, _ = kmeans_metastable_labeling(
+            X_cluster,
+            n_clusters=best_k,
+            quantile=inter_quantile,
+            random_state=kmeans_random_state,
+            n_init=kmeans_n_init,
+        )
+
+        pair_labels = None
+        pairs = None
+        if make_pairwise:
+            pair_labels, pairs = build_pairwise_labels(meta_state, best_k)
+
+        meta.update({
+            "n_frames": int(n_frames),
+            "feature_dim": int(feat_dim),
+            "k_selected": int(best_k),
+            "pairs": pairs,
+            "config": config,
+            "cv_headers": cv_headers,
+            "standardize_features": bool(standardize),
+            "cluster_space": cluster_space,
+            "pca_cluster_dim": int(pca_cluster_dim) if cluster_space == "pca_highdim" else None,
+            "intermediate_quantile": float(inter_quantile),
+            "elbow": {
+                "ks": ks,
+                "inertias": inertias,
+                "method": config.get("elbow_method", "knee"),
+            },
+            "notes": "features are minimal Z-matrix coordinates in float32; relabel-only recomputes only meta-state labels.",
+        })
+
+        save_dataset(
+            dataset_path=dataset_path,
+            save_format=loaded["format"],
+            features_all=features_all,
+            weights=weights,
+            meta_state=meta_state,
+            dist_to_centroid=dist_to_centroid,
+            thresholds=thresholds,
+            meta=meta,
+            cv_data=cv_data,
+            pair_labels=pair_labels,
+        )
+        print(f"[RELABEL] Updated dataset labels in: {dataset_path}")
+
+        if save_cv:
+            if cv_data is None or not cv_headers:
+                print("[WARN] Existing dataset has no saved CV block; skipping weights_and_labels.csv update.")
+            else:
+                weights_csv = os.path.join(output_dir, "weights_and_labels.csv")
+                df = pd.DataFrame(cv_data, columns=cv_headers)
+                df.insert(0, "frame", np.arange(n_frames, dtype=np.int64))
+                df["weight"] = weights
+                df["meta_state"] = meta_state
+                df["is_intermediate"] = (meta_state == -1).astype(np.int8)
+                df["dist_to_centroid"] = dist_to_centroid
+                df["k_selected"] = best_k
+                df.to_csv(weights_csv, index=False)
+                print(f"[RELABEL] Updated labels CSV: {weights_csv}")
+        return
 
     # ---- find DCD files ----
     match_prefix = config["match"]
@@ -335,13 +683,13 @@ def run_pipeline(config):
         raise RuntimeError(f"No DCD files found with prefix '{match_prefix}' in {dcd_folder}")
 
     all_features = []
-    all_desc2 = []
     all_colvars = []
     all_universes = []
+    frame_counts = []
     headers_ref = None
 
     # =====================================================
-    # 1) Load trajectories, build 3N-6 features, and 2D PCA descriptor for weights
+    # 1) Load trajectories and build internal-coordinate features
     # =====================================================
     for dcd_path in tqdm(dcd_files, desc="Processing trajectories"):
         base = os.path.splitext(dcd_path)[0]
@@ -362,14 +710,10 @@ def run_pipeline(config):
             feats.append(internal_coords_min_zmatrix(sel_w.positions, bonds, angles, diheds))
         feats = np.asarray(feats, dtype=np.float32)  # (n_frames_traj, 3N-6)
 
-        # 2D descriptor for reweighting: PCA on this traj's features
-        pca2 = PCA(n_components=2)
-        desc2 = pca2.fit_transform(feats).astype(np.float32)
-
         headers, colvars_data = read_colvars(colvars_path, index_mismatch=index_mismatch)
         colvars_data = colvars_data[::every]
-        if len(colvars_data) != len(desc2):
-            raise ValueError(f"Frame mismatch: {dcd_path} (colvars {len(colvars_data)} vs traj {len(desc2)})")
+        if len(colvars_data) != len(feats):
+            raise ValueError(f"Frame mismatch: {dcd_path} (colvars {len(colvars_data)} vs traj {len(feats)})")
 
         if headers_ref is None:
             headers_ref = headers
@@ -378,67 +722,57 @@ def run_pipeline(config):
                 raise ValueError("Colvars headers differ across trajectories. Please unify colvars outputs.")
 
         all_features.append(feats)
-        all_desc2.append(desc2)
         all_colvars.append(colvars_data.astype(np.float32))
         all_universes.append(sel_out.universe)
+        frame_counts.append(len(feats))
 
     if len(all_features) == 0:
         raise RuntimeError("No valid trajectories after filtering colvars.")
 
     features_all = np.vstack(all_features).astype(np.float32)
-    desc2_all = np.vstack(all_desc2).astype(np.float32)
     colvars_all = np.vstack(all_colvars).astype(np.float32)
 
     n_frames, feat_dim = features_all.shape
     print(f"[INFO] Total frames: {n_frames}, feature dim (3N-6): {feat_dim}, colvars dim: {colvars_all.shape[1]}")
 
     # =====================================================
-    # 2) Reweighting weights from 2D descriptor (same idea as your current script)
+    # 2) Reweighting weights from RiteWeight
     # =====================================================
-    # Init/final sets per trajectory
-    desc_init = np.vstack([d[: max(1, int(split * len(d)))] for d in all_desc2]).astype(np.float32)
-    desc_final = np.vstack([d[-max(1, int(split * len(d))):] for d in all_desc2]).astype(np.float32)
+    seg_start_idx, seg_end_idx = build_segment_indices(frame_counts, rw_lag)
+    max_rw_clusters = max(1, min(int(seg_start_idx.size - 1), int(n_frames - 1)))
+    if rw_n_clusters is None:
+        rw_n_clusters = min(100, max_rw_clusters)
+    rw_n_clusters = int(rw_n_clusters)
+    if rw_n_clusters > max_rw_clusters:
+        print(
+            f"[WARN] riteweight.n_clusters={rw_n_clusters} is too large for {seg_start_idx.size} segments; "
+            f"using {max_rw_clusters} instead."
+        )
+        rw_n_clusters = max_rw_clusters
+    if rw_n_clusters < 1:
+        raise RuntimeError("RiteWeight requires at least one cluster.")
 
-    # histogram bins
-    xbins = np.linspace(np.min(desc2_all[:, 0]), np.max(desc2_all[:, 0]), 10)
-    ybins = np.linspace(np.min(desc2_all[:, 1]), np.max(desc2_all[:, 1]), 10)
-    H_init, _, _ = np.histogram2d(desc_init[:, 0], desc_init[:, 1], bins=(xbins, ybins), density=True)
-    H_final, _, _ = np.histogram2d(desc_final[:, 0], desc_final[:, 1], bins=(xbins, ybins), density=True)
+    weights, delta_history = riteweight(
+        features_all,
+        seg_start_idx,
+        seg_end_idx,
+        n_clusters=rw_n_clusters,
+        n_iter=rw_n_iter,
+        tol=rw_tol,
+        tol_window=rw_tol_window,
+        avg_last=rw_avg_last,
+        seed=rw_seed,
+    )
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        deltaF = -kB * temperature * np.log(H_final / (H_init + 1e-10))
-        finite = np.isfinite(deltaF)
-        if not np.any(finite):
-            raise RuntimeError("deltaF is entirely non-finite. Adjust bins/split.")
-        deltaF -= np.nanmin(deltaF[finite])
-
-    if write_diag:
-        Xg, Yg = np.meshgrid(0.5 * (xbins[:-1] + xbins[1:]), 0.5 * (ybins[:-1] + ybins[1:]))
-        plt.figure(figsize=(6, 5))
-        plt.contourf(Xg, Yg, deltaF.T, levels=20, cmap="viridis")
-        plt.colorbar(label="ΔF (kcal/mol)")
-        plt.xlabel("PC1 (per-traj PCA on 3N-6)")
-        plt.ylabel("PC2 (per-traj PCA on 3N-6)")
-        plt.title("ΔF in 2D PCA projection")
+    if write_diag and len(delta_history) > 0:
+        plt.figure(figsize=(6, 4))
+        plt.plot(np.arange(1, len(delta_history) + 1), delta_history, marker="o")
+        plt.xlabel("Iteration")
+        plt.ylabel("L1 delta")
+        plt.title("RiteWeight convergence")
         plt.tight_layout()
-        plt.savefig(deltaF_png)
+        plt.savefig(riteweight_png)
         plt.close()
-
-    # compute weights by bin lookup
-    weights = np.zeros(n_frames, dtype=np.float32)
-    for i, (x, y) in enumerate(desc2_all):
-        ix = np.digitize(x, xbins) - 1
-        iy = np.digitize(y, ybins) - 1
-        if 0 <= ix < deltaF.shape[0] and 0 <= iy < deltaF.shape[1]:
-            df_ = deltaF[ix, iy]
-            weights[i] = np.exp(-beta * df_) if np.isfinite(df_) else 0.0
-        else:
-            weights[i] = 0.0
-
-    s = float(np.sum(weights))
-    if s <= 0:
-        raise RuntimeError("All weights are zero. Check ΔF binning / PCA projection / split.")
-    weights /= s
 
     # =====================================================
     # 3) KMeans on 3N-6 features, automatic k via elbow
@@ -455,16 +789,12 @@ def run_pipeline(config):
         pca_cluster = PCA(n_components=ncomp)
         X_cluster = pca_cluster.fit_transform(X_cluster)
 
-    best_k, ks, inertias = choose_k_elbow(
+    best_k, ks, inertias = select_k_for_clustering(
         X_cluster,
-        kmin=kmin,
-        kmax=kmax,
-        method=elbow_method,
-        random_state=kmeans_random_state,
-        n_init=kmeans_n_init,
-        out_png=(elbow_png if write_diag else None),
+        config,
+        write_diag=write_diag,
+        elbow_png=elbow_png,
     )
-    print(f"[KMeans] Elbow selected k = {best_k}")
 
     meta_state, dist_to_centroid, thresholds, kmeans = kmeans_metastable_labeling(
         X_cluster,
@@ -488,6 +818,8 @@ def run_pipeline(config):
         df = pd.DataFrame(colvars_all, columns=headers_ref)
         df.insert(0, "frame", np.arange(n_frames, dtype=np.int64))
         df["weight"] = weights
+        df["riteweight_segment_start"] = 0
+        df.loc[seg_start_idx, "riteweight_segment_start"] = 1
         df["meta_state"] = meta_state
         df["is_intermediate"] = (meta_state == -1).astype(np.int8)
         df["dist_to_centroid"] = dist_to_centroid
@@ -527,12 +859,24 @@ def run_pipeline(config):
         "pairs": pairs,  # list[(i,j)] or None
         "cv_headers": cv_headers if save_cv else None,
         "config": config,
+        "weighting_method": "riteweight",
+        "riteweight": {
+            "n_clusters": int(rw_n_clusters),
+            "n_iter": int(rw_n_iter),
+            "tol": float(rw_tol),
+            "tol_window": int(rw_tol_window),
+            "avg_last": int(rw_avg_last),
+            "seed": int(rw_seed),
+            "lag": int(rw_lag),
+            "n_segments": int(seg_start_idx.size),
+            "delta_history": delta_history.tolist(),
+        },
         "standardize_features": bool(standardize),
         "cluster_space": cluster_space,
         "pca_cluster_dim": int(pca_cluster_dim) if cluster_space == "pca_highdim" else None,
         "intermediate_quantile": float(inter_quantile),
-        "elbow": {"ks": ks, "inertias": inertias.tolist(), "method": elbow_method},
-        "notes": "features are minimal Z-matrix (bonds, angles, dihedrals) in float32; weights normalized to sum=1.",
+        "elbow": {"ks": ks, "inertias": inertias, "method": config.get("elbow_method", "knee")},
+        "notes": "features are minimal Z-matrix coordinates in float32; weights come from RiteWeight and are normalized to sum=1.",
     }
 
     if save_format == "pt":
@@ -540,46 +884,23 @@ def run_pipeline(config):
             print("[WARN] torch not available; falling back to NPZ.")
             save_format = "npz"
 
-    if save_format == "pt":
-        out_pt = dataset_base + ".pt"
-        pack = {
-            "features": torch.from_numpy(features_all),                 # float32
-            "weights": torch.from_numpy(weights.astype(np.float32)),    # float32
-            "meta_state": torch.from_numpy(meta_state.astype(np.int64)),# int64
-            "dist_to_centroid": torch.from_numpy(dist_to_centroid.astype(np.float32)),
-            "meta": meta,
-        }
-        if save_cv:
-            pack["cv"] = torch.from_numpy(cv_data.astype(np.float32))
-        if make_pairwise and pair_labels is not None:
-            pack["pair_labels"] = torch.from_numpy(pair_labels.astype(np.int8))
-        # save cluster transforms if you want reproducibility
-        # (torch can store pickled sklearn objects but it’s brittle; better store params only)
-        torch.save(pack, out_pt)
-        print(f"[DATASET] Saved torch dataset: {out_pt}")
+    dataset_path = infer_dataset_path(output_dir, save_format, config.get("dataset_path"))
+    save_dataset(
+        dataset_path=dataset_path,
+        save_format=save_format,
+        features_all=features_all,
+        weights=weights,
+        meta_state=meta_state,
+        dist_to_centroid=dist_to_centroid,
+        thresholds=thresholds,
+        meta=meta,
+        cv_data=(cv_data if save_cv else None),
+        pair_labels=(pair_labels if make_pairwise else None),
+    )
+    print(f"[DATASET] Saved dataset: {dataset_path}")
 
-        # optionally also save a lightweight npy for thresholds
-        np.save(os.path.join(output_dir, "kmeans_thresholds.npy"), thresholds)
-    else:
-        out_npz = dataset_base + ".npz"
-        npz_dict = {
-            "features": features_all.astype(np.float32),
-            "weights": weights.astype(np.float32),
-            "meta_state": meta_state.astype(np.int64),
-            "dist_to_centroid": dist_to_centroid.astype(np.float32),
-            "thresholds": thresholds.astype(np.float32),
-        }
-        if save_cv:
-            npz_dict["cv"] = cv_data.astype(np.float32)
-            # headers go in meta json-like
-        if make_pairwise and pair_labels is not None:
-            npz_dict["pair_labels"] = pair_labels.astype(np.int8)
-
-        # store meta as yaml string (portable)
-        meta_yaml = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True)
-        npz_dict["meta_yaml"] = np.array([meta_yaml], dtype=object)
-        np.savez_compressed(out_npz, **npz_dict)
-        print(f"[DATASET] Saved NPZ dataset: {out_npz}")
+    # optionally also save a lightweight npy for thresholds
+    np.save(os.path.join(output_dir, "kmeans_thresholds.npy"), thresholds)
 
     # =====================================================
     # 6) Optional: write concatenated DCD
@@ -604,15 +925,36 @@ def run_pipeline(config):
                 pass
 
 
+def load_multistate_config(config_path):
+    with open(config_path, "r") as f:
+        raw_config = yaml.safe_load(f)
+
+    if raw_config is None:
+        raise ValueError(f"Config file is empty: {config_path}")
+
+    if isinstance(raw_config, dict) and "MultiState" in raw_config:
+        config = raw_config["MultiState"]
+        if not isinstance(config, dict):
+            raise ValueError("Config block 'MultiState' must be a mapping.")
+        return config
+
+    if not isinstance(raw_config, dict):
+        raise ValueError("Config file must contain a mapping at the top level.")
+
+    return raw_config
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build 3N-6 dataset + weights + auto-k KMeans meta-state labels")
     parser.add_argument("--config", required=True, help="Path to YAML config")
+    parser.add_argument(
+        "--relabel-only",
+        action="store_true",
+        help="Reload an existing dataset and recompute only the meta-state labels.",
+    )
     args = parser.parse_args()
-
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
-
-    run_pipeline(config)
+    config = load_multistate_config(args.config)
+    run_pipeline(config, relabel_only=args.relabel_only)
 
 
 if __name__ == "__main__":
