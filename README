@@ -1,0 +1,2 @@
+sample.py: intial noise N(0,1).
+sample3.py: initial noise is biased interp_pt_cent = (1 - alpha) * ref_A_norm_cent + alpha * ref_B_norm_cent
